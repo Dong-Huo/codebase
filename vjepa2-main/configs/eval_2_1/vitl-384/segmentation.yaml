@@ -1,0 +1,55 @@
+cpus_per_task: 16
+eval_name: segmentation_frozen
+folder: /your_folder/evals_2_1/vitl-384/segmentation
+mem_per_gpu: 80G
+nodes: 2
+resume_checkpoint: true
+tag: seg-vitl16-384-ade20k
+tasks_per_node: 8
+
+model_kwargs:
+  checkpoint: /your_vjepa2_1_checkpoints/vjepa2_1_vitl_dist_vitG_384.pt
+  module_name: evals.segmentation_frozen.modelcustom.vit_encoder_seg
+  pretrain_kwargs:
+    encoder:
+      model_name: vit_large          # depth=24 → hierarchical_layers=[5,11,17,23]
+      checkpoint_key: ema_encoder
+      patch_size: 16
+      tubelet_size: 2
+      use_rope: true
+      uniform_power: false
+      img_temporal_dim_size: 1       # tells the encoder to treat input as an image
+      interpolate_rope: true
+      modality_embedding: true
+      # out_layers must match the model's hierarchical_layers for the given depth.
+      # For depth=24 (vit_large): [5, 11, 17, 23]
+      # For depth=12 (vit_base):  [2, 5, 8, 11]
+      # For depth=40 (vit_giant): [9, 19, 29, 39]
+      out_layers: [5, 11, 17, 23]
+  wrapper_kwargs:
+    num_classes: 150   # ADE20K: 150 | Pascal VOC: 21 | Cityscapes: 19
+    fpn_dim: 256       # FPN lateral + merge channel width
+    num_levels: 4      # must equal len(out_layers)
+
+experiment:
+  data:
+    # dataset_name: one of "ade20k" | "voc2012" | "cityscapes" | "generic"
+    #   ade20k     - expects images/{training,validation}/ + annotations/{training,validation}/
+    #   voc2012    - expects JPEGImages/ + SegmentationClass/ + ImageSets/Segmentation/
+    #   cityscapes - expects leftImg8bit/{train,val}/ + gtFine/{train,val}/
+    #   generic    - reads (train_split, val_split) text files: "<img> <mask>" per line
+    dataset_name: ade20k
+    root: /your_data_path/ADE20K/
+    # train_split / val_split only needed when dataset_name is "generic"
+    # train_split: /your_data_path/ADE20K/train.txt
+    # val_split:   /your_data_path/ADE20K/val.txt
+    num_classes: 150
+    resolution: 384
+    ignore_index: 255   # pixel value to ignore in loss and mIoU computation
+  optimization:
+    batch_size: 16
+    lr: 0.001
+    weight_decay: 0.0001
+    warmup_epochs: 5
+    num_epochs: 50
+    use_bfloat16: true
