@@ -254,9 +254,11 @@ def main(args_eval, resume_preempt=False):
         )
         if rank == 0:
             csv_logger.log(epoch + 1, train_loss, val_miou)
+            # Save only the decoder — the encoder is frozen and is always
+            # reloaded from the pretrained backbone checkpoint.
             torch.save(
                 {
-                    "model": model.state_dict(),
+                    "decoder": _get_decoder(model).state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "scaler": scaler.state_dict() if scaler else None,
                     "epoch": epoch + 1,
@@ -272,17 +274,21 @@ def main(args_eval, resume_preempt=False):
 # Epoch runner
 # ---------------------------------------------------------------------------
 
+def _get_decoder(model):
+    """Return the decoder module regardless of DDP wrapping."""
+    m = model.module if hasattr(model, "module") else model
+    return m.decoder
+
+
 def _run_epoch(
     model, loader, optimizer, scheduler, scaler, device,
     num_classes, ignore_index, training, use_bfloat16,
 ):
-    model.train(mode=training)
-    if not training:
-        # Keep encoder always in eval mode (frozen BN etc.)
-        try:
-            model.module.encoder.eval()
-        except AttributeError:
-            model.encoder.eval()
+    # Set decoder to the correct mode; encoder stays in eval() always
+    # (it is frozen — train mode would enable dropout / update BN stats).
+    _get_decoder(model).train(mode=training)
+    m = model.module if hasattr(model, "module") else model
+    m.encoder.eval()
 
     loss_meter = AverageMeter()
     metrics = SegmentationMetrics(num_classes=num_classes, ignore_index=ignore_index)
@@ -354,7 +360,7 @@ def _build_cosine_scheduler(optimizer, warmup_epochs, total_epochs,
 
 def _load_checkpoint(path, model, optimizer, scaler, device):
     ckpt = robust_checkpoint_loader(path, map_location=device)
-    model.load_state_dict(ckpt["model"])
+    _get_decoder(model).load_state_dict(ckpt["decoder"])
     optimizer.load_state_dict(ckpt["optimizer"])
     if scaler is not None and ckpt.get("scaler") is not None:
         scaler.load_state_dict(ckpt["scaler"])
