@@ -36,8 +36,8 @@ from torch.nn.parallel import DistributedDataParallel
 
 from evals.segmentation_frozen.dataset import make_segmentation_dataloader
 from evals.segmentation_frozen.models import init_module
+from evals.segmentation_frozen.visualize import get_palette, save_seg_visualizations
 from src.utils.checkpoint_loader import robust_checkpoint_loader
-
 from src.utils.logging import AverageMeter, CSVLogger, get_logger
 
 logger = get_logger("segmentation_frozen")
@@ -156,6 +156,12 @@ def main(args_eval, resume_preempt=False):
         )
 
     # -----------------------------------------------------------------------
+    # Visualization palette  (built once, reused every epoch)
+    # -----------------------------------------------------------------------
+    vis_dir = os.path.join(out_dir, "vis")
+    palette = get_palette(dataset_name, num_classes)
+
+    # -----------------------------------------------------------------------
     # Model
     # -----------------------------------------------------------------------
     model = init_module(
@@ -164,7 +170,7 @@ def main(args_eval, resume_preempt=False):
         resolution=resolution,
         checkpoint=checkpoint,
         model_kwargs=pretrain_kwargs,
-        wrapper_kwargs=dict(num_classes=num_classes, **wrapper_kwargs),
+        wrapper_kwargs=dict(**wrapper_kwargs),
     )
     # Only wrap with DDP when the process group was actually initialised.
     # Falls back to plain nn.Module for single-GPU / CPU runs.
@@ -246,6 +252,8 @@ def main(args_eval, resume_preempt=False):
             scheduler=scheduler, scaler=scaler, device=device,
             num_classes=num_classes, ignore_index=ignore_index,
             training=False, use_bfloat16=use_bfloat16,
+            vis_dir=vis_dir if rank == 0 else None,
+            palette=palette, epoch=epoch + 1,
         )
 
         logger.info(
@@ -283,6 +291,7 @@ def _get_decoder(model):
 def _run_epoch(
     model, loader, optimizer, scheduler, scaler, device,
     num_classes, ignore_index, training, use_bfloat16,
+    vis_dir=None, palette=None, epoch=None,
 ):
     # Set decoder to the correct mode; encoder stays in eval() always
     # (it is frozen — train mode would enable dropout / update BN stats).
@@ -327,7 +336,19 @@ def _run_epoch(
             loss_meter.update(loss.item())
             metrics.update(logits.detach(), masks)
 
-        if itr % 50 == 0:
+        # Save visualizations on the first batch of each validation epoch
+        if not training and itr == 0 and vis_dir is not None:
+            save_seg_visualizations(
+                out_dir=vis_dir,
+                epoch=epoch,
+                images=images,
+                gt_masks=masks,
+                pred_logits=logits.detach(),
+                palette=palette,
+                ignore_index=ignore_index,
+            )
+
+        if itr % 1 == 0:
             logger.info(
                 "[%5d] loss=%.4f  [mem=%.0fMB]"
                 % (itr, loss_meter.avg,
