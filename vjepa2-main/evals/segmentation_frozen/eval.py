@@ -26,18 +26,18 @@ try:
 except Exception:
     pass
 
-import logging
 import math
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 
 from evals.segmentation_frozen.dataset import make_segmentation_dataloader
 from evals.segmentation_frozen.models import init_module
 from src.utils.checkpoint_loader import robust_checkpoint_loader
-from src.utils.distributed import init_distributed
+
 from src.utils.logging import AverageMeter, CSVLogger, get_logger
 
 logger = get_logger("segmentation_frozen")
@@ -128,18 +128,16 @@ def main(args_eval, resume_preempt=False):
     use_bfloat16 = args_opt.get("use_bfloat16", True)
     # -----------------------------------------------------------------------
 
-    try:
-        import torch.multiprocessing as mp
-        mp.set_start_method("spawn")
-    except Exception:
-        pass
+    # evals/main.py already spawns one process per GPU and calls
+    # init_distributed() before reaching here — do not call set_start_method
+    # or init_distributed() again; just read the already-initialised state.
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    logger.info(f"Initialized (rank/world-size) {rank}/{world_size}")
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device(f"cuda:0" if torch.cuda.is_available() else "cpu")
     if torch.cuda.is_available():
         torch.cuda.set_device(device)
-
-    world_size, rank = init_distributed()
-    logger.info(f"Initialized (rank/world-size) {rank}/{world_size}")
 
     # Output paths
     out_dir = os.path.join(pretrain_folder, "segmentation_frozen")
@@ -168,7 +166,10 @@ def main(args_eval, resume_preempt=False):
         model_kwargs=pretrain_kwargs,
         wrapper_kwargs=dict(num_classes=num_classes, **wrapper_kwargs),
     )
-    model = DistributedDataParallel(model, find_unused_parameters=False)
+    # Only wrap with DDP when the process group was actually initialised.
+    # Falls back to plain nn.Module for single-GPU / CPU runs.
+    if dist.is_initialized():
+        model = DistributedDataParallel(model, find_unused_parameters=False)
 
     # -----------------------------------------------------------------------
     # Data
@@ -211,7 +212,7 @@ def main(args_eval, resume_preempt=False):
     )
     scheduler = _build_cosine_scheduler(
         optimizer, warmup_epochs=warmup_epochs, total_epochs=num_epochs,
-        base_lr=base_lr, iterations_per_epoch=ipe,
+        iterations_per_epoch=ipe,
     )
     scaler = torch.cuda.amp.GradScaler() if use_bfloat16 else None
 
@@ -337,7 +338,7 @@ def _run_epoch(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _build_cosine_scheduler(optimizer, warmup_epochs, total_epochs, base_lr,
+def _build_cosine_scheduler(optimizer, warmup_epochs, total_epochs,
                              iterations_per_epoch):
     warmup_iters = warmup_epochs * iterations_per_epoch
     total_iters = total_epochs * iterations_per_epoch
