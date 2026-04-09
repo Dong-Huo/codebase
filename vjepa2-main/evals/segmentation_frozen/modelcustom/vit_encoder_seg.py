@@ -140,38 +140,40 @@ def init_module(
 # ---------------------------------------------------------------------------
 
 class LateralBlock(nn.Module):
-    """1×1 projection + 3×3 refinement, operating on 2-D spatial grids."""
+    """
+    1×1 channel projection + 3×3 spatial refinement.
+
+    Accepts pre-upsampled spatial feature maps [B, in_dim, H, W] — the
+    token→spatial reshape has already been done (and upsampling applied)
+    before this block is called.
+    """
 
     def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
-        self.proj = nn.Linear(in_dim, out_dim)
+        self.proj = nn.Conv2d(in_dim, out_dim, kernel_size=1, bias=False)
         self.refine = nn.Sequential(
             nn.Conv2d(out_dim, out_dim, 3, padding=1, bias=False),
             nn.BatchNorm2d(out_dim),
             nn.ReLU(inplace=True),
         )
 
-    def forward(self, tokens: torch.Tensor, H: int, W: int) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            tokens: [B, N, embed_dim]  (N = H*W spatial tokens)
-            H, W:   spatial grid dimensions
+            x: [B, in_dim, H, W]  — already at target spatial resolution
         Returns:
             [B, out_dim, H, W]
         """
-        x = self.proj(tokens)
-        x = x.reshape(x.size(0), H, W, -1).permute(0, 3, 1, 2)
-        return self.refine(x)
+        return self.refine(self.proj(x))
 
 
 class FPNDecoder(nn.Module):
     """
-    Lightweight Feature Pyramid Network that fuses hierarchical feature maps
-    from the V-JEPA 2.1 encoder into a single [B, fpn_dim//2, H_patch, W_patch]
-    representation at patch-grid resolution.
+    Lightweight FPN that fuses hierarchical feature maps already upsampled to
+    full image resolution, producing a single dense feature map for classification.
 
-    Upsampling to pixel space is handled externally (AnyUp or bilinear),
-    followed by a 1×1 classifier conv — both owned by DenseEncoderWrapper.
+    Input:  list of num_levels × [B, embed_dim, H, W]  (all at image resolution)
+    Output: [B, fpn_dim//2, H, W]
     """
 
     def __init__(self, embed_dim: int, fpn_dim: int, num_levels: int):
@@ -193,7 +195,6 @@ class FPNDecoder(nn.Module):
             ]
         )
 
-        # Reduce to output channels before upsampling
         self.out_conv = nn.Sequential(
             nn.Conv2d(fpn_dim, fpn_dim // 2, 3, padding=1, bias=False),
             nn.BatchNorm2d(fpn_dim // 2),
@@ -201,23 +202,21 @@ class FPNDecoder(nn.Module):
         )
         self.out_dim = fpn_dim // 2
 
-    def forward(self, features: list, H: int, W: int) -> torch.Tensor:
+    def forward(self, features: list) -> torch.Tensor:
         """
         Args:
-            features: list of [B, N, embed_dim] tensors, coarse → fine
-            H, W:     patch-grid spatial dimensions
+            features: list of [B, embed_dim, H, W], coarse → fine,
+                      all already at the same (full image) resolution
         Returns:
-            [B, fpn_dim//2, H, W]  — patch-resolution features
+            [B, fpn_dim//2, H, W]
         """
-        maps = [lat(f, H, W) for lat, f in zip(self.laterals, features)]
+        maps = [lat(f) for lat, f in zip(self.laterals, features)]
 
         out = maps[-1]
         for i in range(len(maps) - 2, -1, -1):
-            coarse = F.interpolate(maps[i], size=out.shape[-2:],
-                                   mode="bilinear", align_corners=False)
-            out = self.merges[i](out + coarse)
+            out = self.merges[i](out + maps[i])
 
-        return self.out_conv(out)   # [B, fpn_dim//2, H, W]
+        return self.out_conv(out)
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +294,27 @@ class DenseEncoderWrapper(nn.Module):
         # 1×1 classifier: maps FPN features → class logits at pixel resolution
         self.classifier = nn.Conv2d(feat_dim, num_classes, kernel_size=1)
 
+    def _tokens_to_spatial(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Reshape [B, N, D] encoder tokens → [B, D, H_patch, W_patch]."""
+        B, N, D = tokens.shape
+        return tokens.reshape(B, self.H_patches, self.W_patches, D).permute(0, 3, 1, 2)
+
+    def _upsample_level(self, x: torch.Tensor, image: torch.Tensor) -> torch.Tensor:
+        """
+        Upsample one encoder feature map from patch-grid to image resolution.
+
+        Args:
+            x:     [B, D, H_patch, W_patch]
+            image: [B, 3, H, W]  — original normalized image (AnyUp guide)
+        Returns:
+            [B, D, H, W]
+        """
+        if self.use_anyup:
+            with torch.no_grad():
+                return self.anyup(image, x)         # guided learned upsample
+        else:
+            return self.upsample(x)                 # bilinear ×patch_size
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -302,19 +322,18 @@ class DenseEncoderWrapper(nn.Module):
         Returns:
             logits: [B, num_classes, H, W]
         """
-        # Encode: list of num_levels × [B, N, embed_dim]
-        features = self.encoder(x)
+        # 1. Encode → list of num_levels × [B, N, embed_dim]
+        token_features = self.encoder(x)
 
-        # FPN fusion → [B, fpn_dim//2, H_patches, W_patches]
-        patch_feats = self.decoder(features, self.H_patches, self.W_patches)
+        # 2. Reshape each level to [B, D, H_patch, W_patch] and upsample to
+        #    full image resolution using AnyUp (guided) or bilinear.
+        hr_features = [
+            self._upsample_level(self._tokens_to_spatial(tok), x)
+            for tok in token_features
+        ]   # list of num_levels × [B, D, H, W]
 
-        # Upsample to full image resolution
-        if self.use_anyup:
-            # AnyUp expects [B, C, h, w] features and [B, 3, H, W] image guide.
-            # It returns [B, C, H, W] — upsampled to image spatial dimensions.
-            with torch.no_grad():
-                hr_feats = self.anyup(x, patch_feats)
-        else:
-            hr_feats = self.upsample(patch_feats)   # bilinear ×patch_size
+        # 3. FPN fusion at full resolution → [B, fpn_dim//2, H, W]
+        fused = self.decoder(hr_features)
 
-        return self.classifier(hr_feats)            # [B, num_classes, H, W]
+        # 4. Classify
+        return self.classifier(fused)               # [B, num_classes, H, W]
