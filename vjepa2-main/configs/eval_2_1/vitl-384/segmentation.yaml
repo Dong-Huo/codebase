@@ -31,6 +31,9 @@ model_kwargs:
     fpn_dim: 256       # FPN lateral + merge channel width
     num_levels: 4      # must equal len(out_layers)
 
+    use_anyup: true
+    anyup_use_natten: false
+
 experiment:
   data:
     # dataset_name: one of "ade20k" | "voc2012" | "cityscapes" | "generic"
