@@ -140,40 +140,37 @@ def init_module(
 # ---------------------------------------------------------------------------
 
 class LateralBlock(nn.Module):
-    """
-    1×1 channel projection + 3×3 spatial refinement.
-
-    Accepts pre-upsampled spatial feature maps [B, in_dim, H, W] — the
-    token→spatial reshape has already been done (and upsampling applied)
-    before this block is called.
-    """
+    """1×1 token projection + 3×3 spatial refinement at patch-grid resolution."""
 
     def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
-        self.proj = nn.Conv2d(in_dim, out_dim, kernel_size=1, bias=False)
+        self.proj = nn.Linear(in_dim, out_dim)
         self.refine = nn.Sequential(
             nn.Conv2d(out_dim, out_dim, 3, padding=1, bias=False),
             nn.BatchNorm2d(out_dim),
             nn.ReLU(inplace=True),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, tokens: torch.Tensor, H: int, W: int) -> torch.Tensor:
         """
         Args:
-            x: [B, in_dim, H, W]  — already at target spatial resolution
+            tokens: [B, N, in_dim]  (N = H * W patch tokens)
+            H, W:   patch-grid spatial dimensions
         Returns:
             [B, out_dim, H, W]
         """
-        return self.refine(self.proj(x))
+        x = self.proj(tokens)                                           # [B, N, out_dim]
+        x = x.reshape(x.size(0), H, W, -1).permute(0, 3, 1, 2)        # [B, out_dim, H, W]
+        return self.refine(x)
 
 
 class FPNDecoder(nn.Module):
     """
-    Lightweight FPN that fuses hierarchical feature maps already upsampled to
-    full image resolution, producing a single dense feature map for classification.
+    Lightweight FPN that fuses hierarchical token features at patch-grid
+    resolution into a single compact feature map.
 
-    Input:  list of num_levels × [B, embed_dim, H, W]  (all at image resolution)
-    Output: [B, fpn_dim//2, H, W]
+    Input:  list of num_levels × [B, N, embed_dim]  (patch-grid tokens)
+    Output: [B, fpn_dim//2, H_patch, W_patch]
     """
 
     def __init__(self, embed_dim: int, fpn_dim: int, num_levels: int):
@@ -202,19 +199,21 @@ class FPNDecoder(nn.Module):
         )
         self.out_dim = fpn_dim // 2
 
-    def forward(self, features: list) -> torch.Tensor:
+    def forward(self, features: list, H: int, W: int) -> torch.Tensor:
         """
         Args:
-            features: list of [B, embed_dim, H, W], coarse → fine,
-                      all already at the same (full image) resolution
+            features: list of [B, N, embed_dim] token tensors, coarse → fine
+            H, W:     patch-grid spatial dimensions (N = H * W)
         Returns:
             [B, fpn_dim//2, H, W]
         """
-        maps = [lat(f) for lat, f in zip(self.laterals, features)]
+        maps = [lat(f, H, W) for lat, f in zip(self.laterals, features)]
 
         out = maps[-1]
         for i in range(len(maps) - 2, -1, -1):
-            out = self.merges[i](out + maps[i])
+            coarse = F.interpolate(maps[i], size=out.shape[-2:],
+                                   mode="bilinear", align_corners=False)
+            out = self.merges[i](out + coarse)
 
         return self.out_conv(out)
 
