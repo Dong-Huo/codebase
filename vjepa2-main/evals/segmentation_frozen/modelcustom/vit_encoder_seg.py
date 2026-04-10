@@ -286,34 +286,31 @@ class DenseEncoderWrapper(nn.Module):
             logger.info("AnyUp loaded and frozen.")
         else:
             self.anyup = None
-            # Bilinear upsample: simple scale factor
-            self.upsample = nn.Upsample(
-                scale_factor=patch_size, mode="bilinear", align_corners=False
-            )
 
         # 1×1 classifier: maps FPN features → class logits at pixel resolution
         self.classifier = nn.Conv2d(feat_dim, num_classes, kernel_size=1)
 
-    def _tokens_to_spatial(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Reshape [B, N, D] encoder tokens → [B, D, H_patch, W_patch]."""
-        B, N, D = tokens.shape
-        return tokens.reshape(B, self.H_patches, self.W_patches, D).permute(0, 3, 1, 2)
-
-    def _upsample_level(self, x: torch.Tensor, image: torch.Tensor) -> torch.Tensor:
+    def _upsample(self, patch_feats: torch.Tensor, image: torch.Tensor) -> torch.Tensor:
         """
-        Upsample one encoder feature map from patch-grid to image resolution.
+        Upsample the FPN output from patch-grid to full image resolution.
 
         Args:
-            x:     [B, D, H_patch, W_patch]
-            image: [B, 3, H, W]  — original normalized image (AnyUp guide)
+            patch_feats: [B, C, H_patch, W_patch]  — fused decoder output
+            image:       [B, 3, H, W]              — original image (AnyUp guide)
         Returns:
-            [B, D, H, W]
+            [B, C, H, W]
+
+        AnyUp weights are frozen (requires_grad=False) so they are not updated,
+        but gradients still flow THROUGH AnyUp back into patch_feats, allowing
+        the FPN to train normally.
         """
         if self.use_anyup:
-            with torch.no_grad():
-                return self.anyup(image, x)         # guided learned upsample
+            return self.anyup(image, patch_feats)
         else:
-            return self.upsample(x)                 # bilinear ×patch_size
+            return F.interpolate(
+                patch_feats, scale_factor=self.patch_size,
+                mode="bilinear", align_corners=False,
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -323,17 +320,13 @@ class DenseEncoderWrapper(nn.Module):
             logits: [B, num_classes, H, W]
         """
         # 1. Encode → list of num_levels × [B, N, embed_dim]
-        token_features = self.encoder(x)
+        features = self.encoder(x)
 
-        # 2. Reshape each level to [B, D, H_patch, W_patch] and upsample to
-        #    full image resolution using AnyUp (guided) or bilinear.
-        hr_features = [
-            self._upsample_level(self._tokens_to_spatial(tok), x)
-            for tok in token_features
-        ]   # list of num_levels × [B, D, H, W]
+        # 2. FPN fusion at patch-grid resolution → [B, fpn_dim//2, H_patch, W_patch]
+        patch_feats = self.decoder(features, self.H_patches, self.W_patches)
 
-        # 3. FPN fusion at full resolution → [B, fpn_dim//2, H, W]
-        fused = self.decoder(hr_features)
+        # 3. Upsample the fused decoder output to full image resolution (one call)
+        hr_feats = self._upsample(patch_feats, x)
 
         # 4. Classify
-        return self.classifier(fused)               # [B, num_classes, H, W]
+        return self.classifier(hr_feats)            # [B, num_classes, H, W]
